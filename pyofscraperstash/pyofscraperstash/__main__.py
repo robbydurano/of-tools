@@ -514,11 +514,18 @@ async def update_performer_avatar(
         logger.info(f"Multiple avatars found for performer {performer}.")
         for index, value in enumerate(avatars):
             print(f"{index} Avatar: {value}")
-        avatar_select = ""
-        while avatar_select not in [index for index in range(len(avatars))]:
-            avatar_select = int(
-                input("Please enter the number of the avatar picture to use: ")
+        try:
+            avatar_select = ""
+            while avatar_select not in [index for index in range(len(avatars))]:
+                avatar_select = int(
+                    input("Please enter the number of the avatar picture to use: ")
+                )
+        except EOFError:
+            file_logger.warning(
+                f"No interactive stdin choosing among {len(avatars)} avatars for "
+                f"{performer} — defaulting to the first one, {avatars[0]!r}."
             )
+            avatar_select = 0
         avatar_path = avatars[avatar_select]
     elif len(avatars) == 1:
         avatar_path = avatars[0]
@@ -563,11 +570,14 @@ async def check_studio_description(
         decide = ""
         pprint(f"Studio {studio['name']} has no description (details field in Stash).")
         if len(text_files) > 0:
-            decide = ""
-            while decide not in ["y", "n"]:
-                decide = input(
-                    f"Description found in {text_files[0]}. Do you want to add it? (y/n): "
-                )
+            # Only reached with sanity_check enabled, a deliberately
+            # interactive review mode -- defaulting to "n" (skip) rather
+            # than guessing content for the user if it's ever run
+            # headless anyway.
+            decide = prompt_yn(
+                f"Description found in {text_files[0]}. Do you want to add it? (y/n): ",
+                default="n",
+            )
             if decide == "y":
                 with open(text_files[0]) as file:
                     temp_studio = {"id": studio["id"]}
@@ -579,12 +589,11 @@ async def check_studio_description(
                     temp_studio["details"] = details
                     return client.update_studio(temp_studio)
         if decide == "n" or decide == "":
-            decide = ""
-            while decide not in ["y", "n"]:
-                decide = input("Do you want to add one? (y/n): ")
-                if decide == "y":
-                    temp_studio = {"id": studio["id"]}
-                    details = input("Enter a description for the performer: ")
+            decide = prompt_yn("Do you want to add one? (y/n): ", default="n")
+            if decide == "y":
+                temp_studio = {"id": studio["id"]}
+                details = prompt_value("Enter a description for the performer: ", default=None)
+                if details:
                     temp_studio["details"] = details
                     return client.update_studio(temp_studio)
     return studio
@@ -680,11 +689,10 @@ async def get_stash_performers(  # noqa: C901
                 gql_performers[performer] = gql_performers[performer][0]
         else:
             if gql_performers[performer] is None:
-                decide = ""
-                while decide not in ["y", "n"]:
-                    decide = input(
-                        f"Performer {performer} not found in Stash. Do you want to create a new performer? (y/n): "
-                    )
+                decide = prompt_yn(
+                    f"Performer {performer} not found in Stash. Do you want to create a new performer? (y/n): ",
+                    default="y",
+                )
                 if decide == "y":
                     run_perf = await create_performer(
                         performer, client, avatar=None, alias=None, details=None
@@ -700,11 +708,10 @@ async def get_stash_performers(  # noqa: C901
     for performer in performers:
         if isinstance(gql_performers.get(performer, None), dict):
             if "default=true" in gql_performers[performer]["image_path"]:
-                decide = ""
-                while decide not in ["y", "n"]:
-                    decide = input(
-                        f"Performer {performer} has no avatar. Do you want to upload one? (y/n): "
-                    )
+                decide = prompt_yn(
+                    f"Performer {performer} has no avatar. Do you want to upload one? (y/n): ",
+                    default="y",
+                )
                 if decide == "y":
                     gql_performers[performer] = await update_performer_avatar(
                         performer, client
@@ -733,11 +740,54 @@ async def get_of_studio_id(client: StashInterface = None) -> int:
             "name": {"modifier": "EQUALS", "value": "OnlyFans (network)"},
         },
     }
+    # Real bug found live (2026-10-05): "url" isn't a real field on
+    # Stash's Studio type any more (same finding as verify_studio_url's
+    # own fix) -- only "urls" exists. An invalid field in an explicit
+    # fragment override isn't just a missing key on the result, it's a
+    # GraphQL validation error for the whole request, so this would
+    # throw outright the first time a brand-new performer's studio
+    # needed creating.
     result = client.find_studios(
-        f=variables["studio_filter"], filter=variables["filter"], fragment="id name url"
+        f=variables["studio_filter"], filter=variables["filter"], fragment="id name urls"
     )
     file_logger.log(5, "%s", pformat(f"Result: {result}"))
     return result[0]["id"]
+
+
+# Real bug found live (2026-10-05, paigeowens): every one of the bare
+# input() calls below crashes with EOFError the instant it runs with no
+# real stdin attached -- exactly how Vault (or any automated caller)
+# launches this as a subprocess. Before this file's earlier
+# headless-execution fixes (see os.get_terminal_size()/main()'s own
+# except block), that crash was silently swallowed and reported as a
+# clean exit; now it surfaces correctly, which is how this one was
+# actually caught -- paigeowens' studio had no URL set, hit
+# verify_studio_url's own interactive y/n prompt, and the whole run died
+# with nothing enriched. These two helpers give every such prompt a
+# sensible default instead, so an unattended run can't be blocked by a
+# question nobody's there to answer; an interactive terminal still gets
+# the real prompt exactly as before.
+def prompt_yn(prompt: str, default: str) -> str:
+    decide = ""
+    while decide not in ("y", "n"):
+        try:
+            decide = input(prompt)
+        except EOFError:
+            file_logger.warning(
+                f"No interactive stdin for prompt {prompt!r} — defaulting to {default!r}."
+            )
+            return default
+    return decide
+
+
+def prompt_value(prompt: str, default: str | None) -> str | None:
+    try:
+        return input(prompt)
+    except EOFError:
+        file_logger.warning(
+            f"No interactive stdin for prompt {prompt!r} — defaulting to {default!r}."
+        )
+        return default
 
 
 async def get_stash_studio(performer: str, client: StashInterface = None) -> dict:
@@ -754,21 +804,30 @@ async def get_stash_studio(performer: str, client: StashInterface = None) -> dic
     )
     file_logger.debug("%s", pformat(f"Result: {result}"))
     if result[0] > 1:
-        decide = ""
-        while decide not in [studio["id"] for studio in result[1]]:
-            print(f"Multiple studios found for performer {performer}.")
-            for studio in result[1]:
-                print(f"ID: {studio['id']} - Name: {studio['name']}")
-            decide = input("Please enter the ID of the correct studio:")
-            for studio in result[1]:
-                if studio["id"] == decide:
-                    return studio
-    elif result[0] == 0:
-        decide = ""
-        while decide not in ["y", "n"]:
-            decide = input(
-                f"No studios found for performer {performer}. Do you want to create one? (y/n): "
+        print(f"Multiple studios found for performer {performer}.")
+        for studio in result[1]:
+            print(f"ID: {studio['id']} - Name: {studio['name']}")
+        # No single generically-"correct" choice exists here the way a
+        # y/n question has one -- headless, the safest default is the
+        # first match (same as this function's own final fallback
+        # return below for the "exactly one" case), logged clearly
+        # rather than silently guessed.
+        valid_ids = [studio["id"] for studio in result[1]]
+        decide = prompt_value("Please enter the ID of the correct studio:", default=None)
+        if decide not in valid_ids:
+            file_logger.warning(
+                f"No interactive stdin (or an unrecognized id) choosing among {len(result[1])} "
+                f"studios for {performer} — defaulting to the first match, id {valid_ids[0]}."
             )
+            return result[1][0]
+        for studio in result[1]:
+            if studio["id"] == decide:
+                return studio
+    elif result[0] == 0:
+        decide = prompt_yn(
+            f"No studios found for performer {performer}. Do you want to create one? (y/n): ",
+            default="y",
+        )
         if decide == "y":
             return await create_studio(performer, client)
         return None
@@ -796,9 +855,9 @@ async def verify_studio_url(
         print(f"Studio {studio['name']} has an incorrect URL")
         print(f"Current URLs: {urls}")
         print(f"Correct URL: {correct_url}")
-        decide = ""
-        while decide not in ["y", "n"]:
-            decide = input(f"Do you want to update the URL for {performer}? (y/n): ")
+        decide = prompt_yn(
+            f"Do you want to update the URL for {performer}? (y/n): ", default="y"
+        )
         if decide == "y":
             variables = {
                 "id": studio["id"],
@@ -1971,6 +2030,10 @@ async def main() -> None:
             try:
                 input(
                     "If these match up press Enter to continue, or Ctrl-C to quit and fix your StashDB..."
+                )
+            except EOFError:
+                file_logger.warning(
+                    "No interactive stdin for the sanity-check confirmation — continuing anyway."
                 )
             except KeyboardInterrupt:
                 logger.warning("Script interrupted. Exiting...")
