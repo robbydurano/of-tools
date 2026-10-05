@@ -75,7 +75,14 @@ def signal_handler(sig, frame):
 
 
 pprint = PrettyPrinter(
-    indent=4, depth=2, compact=True, width=(os.get_terminal_size().columns - 5)
+    # Real bug found live (2026-10-05): os.get_terminal_size() throws
+    # OSError("Inappropriate ioctl for device") the instant this module
+    # is imported when there's no real TTY attached — exactly how Vault
+    # (and any other automated caller) launches this script as a
+    # subprocess, so every such run crashed before main() ever ran.
+    # shutil.get_terminal_size() falls back to its (80, 20) default
+    # instead of raising when stdout isn't a real terminal.
+    indent=4, depth=2, compact=True, width=(shutil.get_terminal_size((80, 20)).columns - 5)
 ).pprint
 
 
@@ -774,10 +781,21 @@ async def verify_studio_url(
     file_logger.debug(f"Verifying URL for studio {studio}")
     if studio is None:
         return None
-    if studio["url"] != f"https://onlyfans.com/{performer}":
+    # Real bug found live (2026-10-05): Stash's Studio type has no
+    # singular `url` field any more (confirmed against the live schema
+    # and a real studio query) -- only `urls`, a list -- so this always
+    # KeyError'd the instant it ran, crashing before a single scene
+    # ever got processed. `studio.get("urls", [])` and checking
+    # membership (rather than equality against a single string) matches
+    # the real shape; the mutation uses the same plural field for the
+    # same reason, rather than the deprecated singular one StudioUpdateInput
+    # still technically accepts.
+    correct_url = f"https://onlyfans.com/{performer}"
+    urls = studio.get("urls", [])
+    if correct_url not in urls:
         print(f"Studio {studio['name']} has an incorrect URL")
-        print(f"Current URL: {studio['url']}")
-        print(f"Correct URL: https://onlyfans.com/{performer}")
+        print(f"Current URLs: {urls}")
+        print(f"Correct URL: {correct_url}")
         decide = ""
         while decide not in ["y", "n"]:
             decide = input(f"Do you want to update the URL for {performer}? (y/n): ")
@@ -785,7 +803,7 @@ async def verify_studio_url(
             variables = {
                 "id": studio["id"],
                 "name": studio["name"],
-                "url": f"https://onlyfans.com/{performer}",
+                "urls": [correct_url],
             }
             return client.update_studio(variables)
     return studio
@@ -1508,13 +1526,19 @@ async def create_or_update_image_galleries(
 
 async def update_scene(
     grouped_medias: dict[any, list[dict[str, any]]], **kwargs
-) -> None:
+) -> set[str]:
     username: str = kwargs.get("username", None)
     stash: StashInterface = kwargs.get("stash", None)
     performer: dict = kwargs.get("performer", None)
     gathered_tags: dict = kwargs.get("labels", None)
+    # Collected and returned (up through process_scene_files, to main's
+    # own end-of-run generate_metadata call) so that call can scope
+    # `sceneIDs` to just what this run actually touched, instead of the
+    # unscoped sweep it used to run unconditionally — see generate_
+    # metadata's own comment for the real incident this fixes.
+    touched_scene_ids: set[str] = set()
     if grouped_medias is None or len(grouped_medias) == 0:
-        return
+        return touched_scene_ids
     bar = progressbar(total=len(grouped_medias), desc=f"Updating scenes for {username}")
     performer_studio = performer.get("studio", False) or await get_stash_studio(
         username, stash
@@ -1598,12 +1622,14 @@ async def update_scene(
                             try:
                                 stash.update_scene(differences)
                                 diff_loop = True
+                                touched_scene_ids.add(scene["id"])
                             except Exception as e:
                                 logger.exception(e, exc_info=True, stack_info=False)
                                 logger.info(f"{differences} \n\n {scene} \n\n {media}")
                                 await asyncio.sleep(rng.uniform(0, 3))
         bar.update(1)
     bar.close()
+    return touched_scene_ids
 
 
 async def process_image_files(db_file: aiosqlite.Connection, **kwargs) -> None:
@@ -1681,7 +1707,7 @@ async def process_image_files(db_file: aiosqlite.Connection, **kwargs) -> None:
     )
 
 
-async def process_scene_files(db_file: aiosqlite.Connection, **kwargs) -> None:
+async def process_scene_files(db_file: aiosqlite.Connection, **kwargs) -> set[str]:
     global runtime_settings
     stash: StashInterface = kwargs["stash"] or Raise(ValueError("stash is required"))
     performer: dict = kwargs["performer"] or Raise(ValueError("performer is required"))
@@ -1740,13 +1766,13 @@ async def process_scene_files(db_file: aiosqlite.Connection, **kwargs) -> None:
     except sqlite3.Error as e:
         logger.exception(e, exc_info=False, stack_info=False)
         logger.info(f"{db_file} - Error: {e}")
-        return None
+        return set()
     grouped_medias = await group_medias_by_post_id(medias)
     gathered_tags: dict = await gather_model_labels(db_file, stash)
     file_logger.log(5, "%s", pformat(f"Gathered Tags: {gathered_tags}"))
     file_logger.log(5, "%s", pformat(f"Grouped Medias: {grouped_medias}"))
 
-    await update_scene(
+    return await update_scene(
         grouped_medias,
         username=username,
         stash=stash,
@@ -1828,13 +1854,34 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
-async def generate_metadata(stash: StashInterface, await_loop: bool = False) -> None:
+async def generate_metadata(
+    stash: StashInterface, scene_ids: set[str], await_loop: bool = False
+) -> None:
+    # Real incident, live (2026-10-05): this call used to run with no
+    # scoping at all — not just for the model(s) this run was asked
+    # for, for the *entire* Stash library, every time it ran. Confirmed
+    # live: a single run for one OnlyFans model triggered a sweep still
+    # at 0.1% progress against a completely unrelated Fansly creator's
+    # files, with an ETA measured at four days, and because Stash only
+    # runs one job at a time, it blocked every other scan/scrape on the
+    # whole machine behind it until cancelled by hand. `scene_ids` is
+    # exactly the set of scenes this run actually changed (collected in
+    # `update_scene`, threaded up through `process_scene_files` and
+    # `main`'s own loop) — scoping `sceneIDs` to that instead means this
+    # can never again sweep anything beyond what this run touched.
+    # Image-side flags (covers/imagePreviews/imageThumbnails) are
+    # dropped entirely rather than scoped, since nothing here currently
+    # tracks individual touched image ids the way scenes now are — an
+    # unscoped image sweep would just be a smaller version of the same
+    # incident, not an acceptable fallback.
+    if not scene_ids:
+        logger.info("No scenes were changed this run — skipping metadata generation.")
+        return
     gen_job = stash.metadata_generate(
         {
-            "covers": True,
+            "sceneIDs": list(scene_ids),
             "sprites": True,
             "previews": True,
-            "imagePreviews": True,
             "previewOptions": {
                 "previewSegments": 12,
                 "previewSegmentDuration": 0.75,
@@ -1848,12 +1895,11 @@ async def generate_metadata(stash: StashInterface, await_loop: bool = False) -> 
             "transcodes": False,
             "phashes": True,
             "interactiveHeatmapsSpeeds": True,
-            "imageThumbnails": True,
             "clipPreviews": True,
             "overwrite": False,
         }
     )
-    logger.info(f"Metadata generation job: {gen_job}")
+    logger.info(f"Metadata generation job for {len(scene_ids)} scene(s): {gen_job}")
     running = await_loop
     while running:
         job_status = stash.find_job(gen_job)
@@ -1942,6 +1988,7 @@ async def main() -> None:
                     stash_studios[performer], performer, stash
                 )
             stash_performers[performer]["studio"] = stash_studios[performer]
+        touched_scene_ids: set[str] = set()
         for username, db_file in metadata_db_sets:
             logger.info(f"Processing performer: {username}")
             file_logger.info(f"Starting scan of {username}'s OF site directory")
@@ -1954,7 +2001,7 @@ async def main() -> None:
                     stash=stash,
                 )
             elif args.scenes_only:
-                await process_scene_files(
+                touched_scene_ids |= await process_scene_files(
                     db_file,
                     performer=stash_performers[username],
                     username=username,
@@ -1967,17 +2014,26 @@ async def main() -> None:
                     username=username,
                     stash=stash,
                 )
-                await process_scene_files(
+                touched_scene_ids |= await process_scene_files(
                     db_file,
                     performer=stash_performers[username],
                     username=username,
                     stash=stash,
                 )
         if runtime_settings.get("metadata_generation", False):
-            await generate_metadata(stash=stash, await_loop=True)
+            await generate_metadata(stash=stash, scene_ids=touched_scene_ids, await_loop=True)
     except Exception as e:
+        # Used to just log and `return` here, exiting 0 regardless of
+        # what broke — a real caller (Vault's PyOFScraperStashRunner)
+        # treats a 0 exit as success, so a crash anywhere in this
+        # function (e.g. a missing config key reaching deep into
+        # update_scene/format_title) silently reported the whole run as
+        # fine while not a single scene actually got updated. Re-raising
+        # after logging lets the process exit non-zero like any other
+        # unhandled exception, so a caller checking the exit code
+        # actually finds out.
         logger.exception(e, exc_info=True, stack_info=True)
-        return
+        raise
     finally:
         for conn in metadata_db_files:
             await conn.close()
