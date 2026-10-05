@@ -1366,7 +1366,7 @@ async def create_or_update_image_galleries(
         if current_gallery is None or len(current_gallery) == 0:
             current_gallery = {}
             current_gallery["title"] = f"{username} - {post_id}"
-            current_gallery["details"] = media_list[0]["text"]
+            current_gallery["details"] = sanitize_string(media_list[0]["text"])
             current_gallery["performer_ids"] = [performer["id"]]
             current_gallery["code"] = f"{post_id}"
             if media_list[0]["created_at"] is not None:
@@ -1384,11 +1384,12 @@ async def create_or_update_image_galleries(
             differences = {"id": gallery_id}
             if current_gallery[0]["title"] != f"{username} - {post_id}":
                 differences["title"] = f"{username} - {post_id}"
+            sanitized_details = sanitize_string(media_list[0]["text"])
             if (
-                current_gallery[0]["details"] != media_list[0]["text"]
-                and media_list[0]["text"] is not None
+                current_gallery[0]["details"] != sanitized_details
+                and sanitized_details is not None
             ):
-                differences["details"] = media_list[0]["text"]
+                differences["details"] = sanitized_details
             if media_list[0]["created_at"] is not None:
                 if isinstance(media_list[0]["created_at"], str):
                     if current_gallery[0]["date"] != dateutil.parser.parse(
@@ -1461,11 +1462,12 @@ async def create_or_update_image_galleries(
                     else:
                         image_diff["title"] = f"{username} - {post_id}"
                     if "details" in file:
+                        sanitized_details = sanitize_string(media_list[0]["text"])
                         if (
-                            file["details"] != media_list[0]["text"]
-                            and media_list[0]["text"] is not None
+                            file["details"] != sanitized_details
+                            and sanitized_details is not None
                         ):
-                            image_diff["details"] = media_list[0]["text"]
+                            image_diff["details"] = sanitized_details
                     else:
                         image_diff["details"] = ""
                     if media_list[0]["created_at"] is not None:
@@ -1584,8 +1586,9 @@ async def update_scene(
                         if scene["title"] != title_holder:
                             differences["title"] = title_holder
                     if media_list[0]["text"]:
-                        if scene["details"] != media_list[0]["text"]:
-                            differences["details"] = media_list[0]["text"]
+                        sanitized_details = sanitize_string(media_list[0]["text"])
+                        if scene["details"] != sanitized_details:
+                            differences["details"] = sanitized_details
                     if media_list[0]["created_at"] is not None:
                         if scene["date"] != media_list[0]["created_at"].strftime(
                             "%Y-%m-%d"
