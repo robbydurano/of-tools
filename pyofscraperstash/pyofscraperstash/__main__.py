@@ -482,34 +482,48 @@ async def create_performer(
     return result
 
 
+def _find_avatar_files(performer_path: str) -> list:
+    """
+    Plain, synchronous filesystem lookup -- deliberately kept separate from
+    update_performer_avatar so it can run in a worker thread with a real
+    deadline (see the asyncio.wait_for call there). os.path.exists()/glob()
+    have no built-in timeout, and every path here lives on an external
+    drive; if that drive stalls for any reason (confirmed live, 2026-10-07:
+    a real run hung for 3+ hours on this exact call, with the drive itself
+    responding normally again minutes later -- a stale/orphaned syscall
+    outlived the stall that caused it), the whole pipeline -- and every
+    other run queued behind it in Vault -- was stuck forever with no
+    recovery.
+    """
+    performer_path_list = os.path.normpath(performer_path).split(os.path.sep)[:-3]
+    performer_path_list.extend(["Profile", "Free", "Images"])
+    performer_path_avatar = os.path.sep + os.path.join(*performer_path_list)
+    if os.path.exists(performer_path_avatar):
+        return glob(os.path.join(performer_path_avatar, "*avatar*"), recursive=True)
+    performer_path_list = os.path.normpath(performer_path).split(os.path.sep)[:-3]
+    performer_path_list.extend(["Profile", "Avatars"])
+    performer_path_avatar = os.path.sep + os.path.join(*performer_path_list)
+    return glob(os.path.join(performer_path_avatar, "*.j*p*g"), recursive=True)
+
+
 async def update_performer_avatar(
     performer: str = None, client: StashInterface = None
 ) -> dict:
     logger.info(f"Updating avatar for performer {performer}")
     performer_path = format_directory(dir_type="dir_format", model_username=performer)
     file_logger.debug("%s", pformat(f"Performer path: {performer_path}"))
-    performer_path_list = os.path.normpath(performer_path).split(os.path.sep)[:-3]
-    performer_path_list.extend(["Profile", "Free", "Images"])
-    file_logger.debug("%s", pformat(f"Performer path list: {performer_path_list}"))
-    performer_path_avatar = os.path.sep + os.path.join(*performer_path_list)
-    avatars = []
     avatar_path = ""
-    if os.path.exists(performer_path_avatar):
-        avatars = glob(os.path.join(performer_path_avatar, "*avatar*"), recursive=True)
-        file_logger.debug("%s", pformat(f"Avatars: {avatars}"))
-    else:
-        file_logger.debug(
-            "%s",
-            pformat(
-                f"Avatar path {performer_path_avatar} doesn't exist, falling back to old path"
-            ),
+    try:
+        avatars = await asyncio.wait_for(
+            asyncio.to_thread(_find_avatar_files, performer_path), timeout=30
         )
-        performer_path_list = os.path.normpath(performer_path).split(os.path.sep)[:-3]
-        performer_path_list.extend(["Profile", "Avatars"])
-        performer_path_avatar = os.path.sep + os.path.join(*performer_path_list)
-        file_logger.debug("%s", pformat(f"Avatar path: {performer_path_avatar}"))
-        avatars = glob(os.path.join(performer_path_avatar, "*.j*p*g"), recursive=True)
-        file_logger.debug("%s", pformat(f"Avatars: {avatars}"))
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"Avatar lookup for {performer} timed out after 30s (drive stall?) "
+            "-- skipping avatar for this run rather than hanging the whole pipeline."
+        )
+        avatars = []
+    file_logger.debug("%s", pformat(f"Avatars: {avatars}"))
     if len(avatars) > 1:
         logger.info(f"Multiple avatars found for performer {performer}.")
         for index, value in enumerate(avatars):
